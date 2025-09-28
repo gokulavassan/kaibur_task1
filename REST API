@@ -1,0 +1,201 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.kaiburr</groupId>
+    <artifactId>task-backend</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.1.6</version>
+    </parent>
+
+    <properties>
+        <java.version>17</java.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot Web + MongoDB -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-mongodb</artifactId>
+        </dependency>
+
+        <!-- JSON date/time support -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+
+"java code"
+package com.kaiburr.tasks;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.mapping.Document;
+import org.springframework.data.mongodb.repository.MongoRepository;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.regex.Pattern;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+
+// --- Spring Boot main ---
+@SpringBootApplication
+public class TaskBackendApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(TaskBackendApplication.class, args);
+    }
+}
+
+// --- Models ---
+class TaskExecution {
+    private Instant startTime;
+    private Instant endTime;
+    private String output;
+
+    public TaskExecution() {}
+    public TaskExecution(Instant startTime, Instant endTime, String output) {
+        this.startTime = startTime; this.endTime = endTime; this.output = output;
+    }
+    public Instant getStartTime() { return startTime; }
+    public void setStartTime(Instant startTime) { this.startTime = startTime; }
+    public Instant getEndTime() { return endTime; }
+    public void setEndTime(Instant endTime) { this.endTime = endTime; }
+    public String getOutput() { return output; }
+    public void setOutput(String output) { this.output = output; }
+}
+
+@Document(collection = "tasks")
+class Task {
+    @Id
+    private String id;
+    private String name;
+    private String owner;
+    private String command;
+    private List<TaskExecution> taskExecutions = new ArrayList<>();
+
+    public Task() {}
+    public Task(String name, String owner, String command) {
+        this.name = name; this.owner = owner; this.command = command;
+    }
+
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getOwner() { return owner; }
+    public void setOwner(String owner) { this.owner = owner; }
+    public String getCommand() { return command; }
+    public void setCommand(String command) { this.command = command; }
+    public List<TaskExecution> getTaskExecutions() { return taskExecutions; }
+    public void setTaskExecutions(List<TaskExecution> list) { this.taskExecutions = list; }
+    public void addExecution(TaskExecution e) { this.taskExecutions.add(e); }
+}
+
+// --- Repository ---
+interface TaskRepository extends MongoRepository<Task, String> {
+    List<Task> findByNameContainingIgnoreCase(String namePart);
+}
+
+// --- Service ---
+@Service
+class TaskService {
+    private final TaskRepository repo;
+    private final String allowPattern = "^[a-zA-Z0-9_\\-\\s:/.]+$";
+
+    public TaskService(TaskRepository repo) { this.repo = repo; }
+
+    public List<Task> getAll() { return repo.findAll(); }
+    public Optional<Task> getById(String id) { return repo.findById(id); }
+    public Task save(Task t) {
+        if (t.getId() == null || t.getId().isBlank()) {
+            t.setId(UUID.randomUUID().toString());
+        }
+        if (t.getCommand() == null || !Pattern.matches(allowPattern, t.getCommand())) {
+            throw new IllegalArgumentException("Unsafe command");
+        }
+        return repo.save(t);
+    }
+    public void delete(String id) { repo.deleteById(id); }
+    public List<Task> findByName(String q) { return repo.findByNameContainingIgnoreCase(q); }
+
+    public TaskExecution executeTask(String id) throws Exception {
+        Task task = repo.findById(id).orElseThrow(() -> new IllegalArgumentException("Task not found"));
+        Instant start = Instant.now();
+        String result = runLocalCommand(task.getCommand());
+        Instant end = Instant.now();
+        TaskExecution exec = new TaskExecution(start, end, result);
+        task.addExecution(exec);
+        repo.save(task);
+        return exec;
+    }
+
+    private String runLocalCommand(String command) throws Exception {
+        String os = System.getProperty("os.name").toLowerCase();
+        ProcessBuilder pb;
+        if (os.contains("win")) {
+            pb = new ProcessBuilder("cmd.exe", "/c", command);
+        } else {
+            pb = new ProcessBuilder("sh", "-c", command);
+        }
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+            String line; while ((line = br.readLine()) != null) sb.append(line).append("\n");
+        }
+        int exit = p.waitFor();
+        sb.append("Exit code: ").append(exit);
+        return sb.toString();
+    }
+}
+
+// --- Controller ---
+@RestController
+@RequestMapping("/api/tasks")
+class TaskController {
+    private final TaskService service;
+    public TaskController(TaskService service) { this.service = service; }
+
+    @GetMapping
+    public Object getAllOrById(@RequestParam(value = "id", required = false) String id) {
+        return id == null ? service.getAll() :
+                service.getById(id).orElseThrow(() -> new RuntimeException("Not found"));
+    }
+
+    @PutMapping
+    public Task putTask(@RequestBody Task t) { return service.save(t); }
+
+    @DeleteMapping("/{id}")
+    public void deleteTask(@PathVariable String id) { service.delete(id); }
+
+    @GetMapping("/search")
+    public List<Task> search(@RequestParam("q") String q) { return service.findByName(q); }
+
+    @PutMapping("/{id}/execute")
+    public TaskExecution exec(@PathVariable String id) throws Exception { return service.executeTask(id); }
+}
